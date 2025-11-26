@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 Adobe. All rights reserved.
+ * Copyright 2025 Adobe. All rights reserved.
  * This file is licensed to you under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License. You may obtain a copy
  * of the License at http://www.apache.org/licenses/LICENSE-2.0
@@ -16,12 +16,24 @@ function sampleRUM(checkpoint, data) {
   const timeShift = () => (window.performance ? window.performance.now() : Date.now() - window.hlx.rum.firstReadTime);
   try {
     window.hlx = window.hlx || {};
-    sampleRUM.enhance = () => {};
-    if (!window.hlx.rum) {
-      const weight = new URLSearchParams(window.location.search).get('rum') === 'on' ? 1 : 100;
-      const id = Math.random().toString(36).slice(-4);
-      const isSelected = Math.random() * weight < 1;
-      // eslint-disable-next-line object-curly-newline, max-len
+    if (!window.hlx.rum || !window.hlx.rum.collector) {
+      sampleRUM.enhance = () => {};
+      const params = new URLSearchParams(window.location.search);
+      const { currentScript } = document;
+      const rate = params.get('rum')
+        || window.SAMPLE_PAGEVIEWS_AT_RATE
+        || params.get('optel')
+        || (currentScript && currentScript.dataset.rate);
+      const rateValue = {
+        on: 1,
+        off: 0,
+        high: 10,
+        low: 1000,
+      }[rate];
+      const weight = rateValue !== undefined ? rateValue : 100;
+      const id = (window.hlx.rum && window.hlx.rum.id) || crypto.randomUUID().slice(-9);
+      const isSelected = (window.hlx.rum && window.hlx.rum.isSelected)
+        || (weight > 0 && Math.random() * weight < 1);
       window.hlx.rum = {
         weight,
         id,
@@ -32,24 +44,52 @@ function sampleRUM(checkpoint, data) {
         collector: (...args) => window.hlx.rum.queue.push(args),
       };
       if (isSelected) {
-        ['error', 'unhandledrejection'].forEach((event) => {
-          window.addEventListener(event, ({ reason, error }) => {
-            const errData = { source: 'undefined error' };
-            try {
-              errData.target = (reason || error).toString();
-              errData.source = (reason || error).stack
+        const dataFromErrorObj = (error) => {
+          const errData = { source: 'undefined error' };
+          try {
+            errData.target = error.toString();
+            if (error.stack) {
+              errData.source = error.stack
                 .split('\n')
                 .filter((line) => line.match(/https?:\/\//))
                 .shift()
                 .replace(/at ([^ ]+) \((.+)\)/, '$1@$2')
+                .replace(/ at /, '@')
                 .trim();
-            } catch (err) {
-              /* error structure was not as expected */
             }
-            sampleRUM('error', errData);
-          });
+          } catch (err) {
+            /* error structure was not as expected */
+          }
+          return errData;
+        };
+
+        window.addEventListener('error', ({ error }) => {
+          const errData = dataFromErrorObj(error);
+          sampleRUM('error', errData);
         });
-        sampleRUM.baseURL = sampleRUM.baseURL || new URL(window.RUM_BASE || '/', new URL('https://rum.hlx.page'));
+
+        window.addEventListener('unhandledrejection', ({ reason }) => {
+          let errData = {
+            source: 'Unhandled Rejection',
+            target: reason || 'Unknown',
+          };
+          if (reason instanceof Error) {
+            errData = dataFromErrorObj(reason);
+          }
+          sampleRUM('error', errData);
+        });
+
+        window.addEventListener('securitypolicyviolation', (e) => {
+          if (e.blockedURI.includes('helix-rum-enhancer') && e.disposition === 'enforce') {
+            const errData = {
+              source: 'csp',
+              target: e.blockedURI,
+            };
+            sampleRUM.sendPing('error', timeShift(), errData);
+          }
+        });
+
+        sampleRUM.baseURL = sampleRUM.baseURL || new URL(window.RUM_BASE || '/', new URL('https://ot.aem.live'));
         sampleRUM.collectBaseURL = sampleRUM.collectBaseURL || sampleRUM.baseURL;
         sampleRUM.sendPing = (ck, time, pingData = {}) => {
           // eslint-disable-next-line max-len, object-curly-newline
@@ -61,7 +101,13 @@ function sampleRUM(checkpoint, data) {
             t: time,
             ...pingData,
           });
-          const { href: url, origin } = new URL(`.rum/${weight}`, sampleRUM.collectBaseURL);
+          const urlParams = window.RUM_PARAMS
+            ? new URLSearchParams(window.RUM_PARAMS).toString() || ''
+            : '';
+          const { href: url, origin } = new URL(
+            `.rum/${weight}${urlParams ? `?${urlParams}` : ''}`,
+            sampleRUM.collectBaseURL,
+          );
           const body = origin === window.location.origin
             ? new Blob([rumData], { type: 'application/json' })
             : rumData;
@@ -72,9 +118,16 @@ function sampleRUM(checkpoint, data) {
         sampleRUM.sendPing('top', timeShift());
 
         sampleRUM.enhance = () => {
+          // only enhance once
+          if (document.querySelector('script[src*="rum-enhancer"]')) return;
+          const { enhancerVersion, enhancerHash } = sampleRUM.enhancerContext || {};
           const script = document.createElement('script');
+          if (enhancerHash) {
+            script.integrity = enhancerHash;
+            script.setAttribute('crossorigin', 'anonymous');
+          }
           script.src = new URL(
-            '.rum/@adobe/helix-rum-enhancer@^2/src/index.js',
+            `.rum/@adobe/helix-rum-enhancer@${enhancerVersion || '^2'}/src/index.js`,
             sampleRUM.baseURL,
           ).href;
           document.head.appendChild(script);
@@ -115,17 +168,19 @@ function setup() {
 }
 
 /**
- * Auto initializiation.
+ * Auto initialization.
  */
+
 function init() {
   setup();
+  sampleRUM.collectBaseURL = window.origin;
   sampleRUM();
 }
 
 /**
  * Sanitizes a string for use as class name.
- * @param {string} name The unsanitized string
- * @returns {string} The class name
+ * @param {string} name Unsanitized string
+ * @returns {string} Class name
  */
 function toClassName(name) {
   return typeof name === 'string'
@@ -139,8 +194,8 @@ function toClassName(name) {
 
 /**
  * Sanitizes a string for use as a js property name.
- * @param {string} name The unsanitized string
- * @returns {string} The camelCased name
+ * @param {string} name Unsanitized string
+ * @returns {string} camelCased name
  */
 function toCamelCase(name) {
   return toClassName(name).replace(/-([a-z])/g, (g) => g[1].toUpperCase());
@@ -148,8 +203,8 @@ function toCamelCase(name) {
 
 /**
  * Extracts the config from a block.
- * @param {Element} block The block element
- * @returns {object} The block config
+ * @param {Element} block Block element
+ * @returns {object}Block config
  */
 // eslint-disable-next-line import/prefer-default-export
 function readBlockConfig(block) {
@@ -210,9 +265,9 @@ async function loadCSS(href) {
 }
 
 /**
- * Loads a non module JS file.
+ * Loads a non-module JS file.
  * @param {string} src URL to the JS file
- * @param {Object} attrs additional optional attributes
+ * @param {Object} attrs Additional optional attributes
  */
 async function loadScript(src, attrs) {
   return new Promise((resolve, reject) => {
@@ -236,9 +291,9 @@ async function loadScript(src, attrs) {
 
 /**
  * Retrieves the content of metadata tags.
- * @param {string} name The metadata name (or property)
- * @param {Document} doc Document object to query for metadata. Defaults to the window's document
- * @returns {string} The metadata value(s)
+ * @param {string} name Metadata name (or property)
+ * @param {Document} doc Document object to query for metadata (defaults to the window's document)
+ * @returns {string} Metadata value(s)
  */
 function getMetadata(name, doc = document) {
   const attr = name && name.includes(':') ? 'property' : 'name';
@@ -249,12 +304,12 @@ function getMetadata(name, doc = document) {
 }
 
 /**
- * Returns a picture element with webp and fallbacks
- * @param {string} src The image URL
- * @param {string} [alt] The image alternative text
+ * Returns a picture element with webp and fallbacks.
+ * @param {string} src Image URL
+ * @param {string} [alt] Image alternative text
  * @param {boolean} [eager] Set loading attribute to eager
  * @param {Array} [breakpoints] Breakpoints and corresponding params (eg. width)
- * @returns {Element} The picture element
+ * @returns {Element} Picture element
  */
 function createOptimizedPicture(
   src,
@@ -312,22 +367,13 @@ function decorateTemplateAndTheme() {
 
 /**
  * Wrap inline text content of block cells within a <p> tag.
- * @param {Element} block the block element
+ * @param {Element} block Block element
  */
 function wrapTextNodes(block) {
   const validWrappers = [
-    'P',
-    'PRE',
-    'UL',
-    'OL',
-    'PICTURE',
-    'TABLE',
-    'H1',
-    'H2',
-    'H3',
-    'H4',
-    'H5',
-    'H6',
+    'P', 'UL', 'OL',
+    'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+    'BLOCKQUOTE', 'PICTURE', 'TABLE', 'PRE',
   ];
 
   const wrap = (el) => {
@@ -354,9 +400,9 @@ function wrapTextNodes(block) {
 
 /**
  * Add <img> for icon, prefixed with codeBasePath and optional prefix.
- * @param {Element} [span] span element with icon classes
- * @param {string} [prefix] prefix to be added to icon src
- * @param {string} [alt] alt text to be added to icon
+ * @param {Element} [span] <span> element with icon classes
+ * @param {string} [prefix] Prefix to be added to icon src
+ * @param {string} [alt] Alternative text to be added to icon
  */
 function decorateIcon(span, prefix = '', alt = '') {
   const iconName = Array.from(span.classList)
@@ -367,6 +413,8 @@ function decorateIcon(span, prefix = '', alt = '') {
   img.src = `${window.hlx.codeBasePath}${prefix}/icons/${iconName}.svg`;
   img.alt = alt;
   img.loading = 'lazy';
+  img.width = 16;
+  img.height = 16;
   span.append(img);
 }
 
@@ -376,7 +424,7 @@ function decorateIcon(span, prefix = '', alt = '') {
  * @param {string} [prefix] prefix to be added to icon the src
  */
 function decorateIcons(element, prefix = '') {
-  const icons = [...element.querySelectorAll('span.icon')];
+  const icons = element.querySelectorAll('span.icon');
   icons.forEach((span) => {
     decorateIcon(span, prefix);
   });
@@ -384,7 +432,7 @@ function decorateIcons(element, prefix = '') {
 
 /**
  * Decorates all sections in a container element.
- * @param {Element} main The container element
+ * @param {Element} main Container element
  */
 function decorateSections(main) {
   main.querySelectorAll(':scope > div').forEach((section) => {
@@ -404,7 +452,7 @@ function decorateSections(main) {
     section.dataset.sectionStatus = 'initialized';
     section.style.display = 'none';
 
-    // Process section metadata
+    // process section metadata
     const sectionMeta = section.querySelector('div.section-metadata');
     if (sectionMeta) {
       const meta = readBlockConfig(sectionMeta);
@@ -463,8 +511,8 @@ async function fetchPlaceholders(prefix = 'default') {
 
 /**
  * Builds a block DOM Element from a two dimensional array, string, or object
- * @param {string} blockName name of the block
- * @param {*} content two dimensional array or string or object of content
+ * @param {string} blockName Name of the block
+ * @param {*} content Two-dimensional array or string or object of content
  */
 function buildBlock(blockName, content) {
   const table = Array.isArray(content) ? content : [[content]];
@@ -494,7 +542,7 @@ function buildBlock(blockName, content) {
 
 /**
  * Loads JS and CSS for a block.
- * @param {Element} block The block element
+ * @param {Element} block Block element
  */
 async function loadBlock(block) {
   const status = block.dataset.blockStatus;
@@ -514,7 +562,7 @@ async function loadBlock(block) {
             }
           } catch (error) {
             // eslint-disable-next-line no-console
-            console.log(`failed to load module for ${blockName}`, error);
+            console.error(`Failed to load module for ${blockName}`, error);
           }
           resolve();
         })();
@@ -522,7 +570,7 @@ async function loadBlock(block) {
       await Promise.all([cssLoaded, decorationComplete]);
     } catch (error) {
       // eslint-disable-next-line no-console
-      console.log(`failed to load block ${blockName}`, error);
+      console.error(`Failed to load block ${blockName}`, error);
     }
     block.dataset.blockStatus = 'loaded';
   }
@@ -531,7 +579,7 @@ async function loadBlock(block) {
 
 /**
  * Decorates a block.
- * @param {Element} block The block element
+ * @param {Element} block Block element
  */
 function decorateBlock(block) {
   const shortBlockName = block.classList[0];
@@ -549,7 +597,7 @@ function decorateBlock(block) {
 
 /**
  * Decorates all blocks in a container element.
- * @param {Element} main The container element
+ * @param {Element} main Container element
  */
 function decorateBlocks(main) {
   main.querySelectorAll('div.section > div > div').forEach(decorateBlock);
@@ -557,7 +605,7 @@ function decorateBlocks(main) {
 
 /**
  * Loads a block named 'header' into header
- * @param {Element} header header element
+ * @param {Element} header Header element
  * @returns {Promise}
  */
 async function loadHeader(header) {
@@ -569,7 +617,7 @@ async function loadHeader(header) {
 
 /**
  * Loads a block named 'footer' into footer
- * @param footer footer element
+ * @param footer Footer element
  * @returns {Promise}
  */
 async function loadFooter(footer) {
@@ -581,7 +629,7 @@ async function loadFooter(footer) {
 
 /**
  * Wait for first (LCP) image.
- * @param {Element} section section element
+ * @param {Element} section Section element
  */
 async function waitForFirstImage(section) {
   const lcpCandidate = section.querySelector('img');
@@ -598,9 +646,8 @@ async function waitForFirstImage(section) {
 
 /**
  * Loads all blocks in a section.
- * @param {Element} section The section element
+ * @param {Element} section Section element
  */
-
 async function loadSection(section, loadCallback) {
   const status = section.dataset.sectionStatus;
   if (!status || status === 'initialized') {
@@ -618,14 +665,16 @@ async function loadSection(section, loadCallback) {
 
 /**
  * Loads all sections.
- * @param {Element} element The parent element of sections to load
+ * @param {Element} element Parent element of sections to load
  */
-
 async function loadSections(element) {
   const sections = [...element.querySelectorAll('div.section')];
   for (let i = 0; i < sections.length; i += 1) {
     // eslint-disable-next-line no-await-in-loop
     await loadSection(sections[i]);
+    if (i === 0 && sampleRUM.enhance) {
+      sampleRUM.enhance();
+    }
   }
 }
 

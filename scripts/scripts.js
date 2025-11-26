@@ -11,7 +11,6 @@ import {
   loadSection,
   loadSections,
   loadCSS,
-  sampleRUM,
 } from './aem.js';
 
 /**
@@ -26,6 +25,10 @@ async function loadFonts() {
   }
 }
 
+/**
+ * Swaps an image icon with its inline SVG when it enters the viewport.
+ * @param {HTMLImageElement} icon Icon image element
+ */
 function swapIcon(icon) {
   const observer = new IntersectionObserver((entries) => {
     entries.forEach(async (entry) => {
@@ -35,15 +38,17 @@ function swapIcon(icon) {
         temp.innerHTML = await resp.text();
         const svg = temp.querySelector('svg');
         temp.remove();
-        // check if svg has inline styles
-        let style = svg.querySelector('style');
-        if (style) style = style.textContent.toLowerCase().includes('currentcolor');
-        let fill = svg.querySelector('[fill]');
-        if (fill) fill = fill.getAttribute('fill').toLowerCase().includes('currentcolor');
-        // replace image with SVG, ensuring color inheritance
-        if ((style || fill) || (!style && !fill)) {
-          icon.replaceWith(svg);
+        if (!svg) {
+          observer.disconnect();
+          return;
         }
+        // check if svg has inline `currentcolor`
+        const style = svg.querySelector('style');
+        const usesStyle = style && style.textContent.toLowerCase().includes('currentcolor');
+        const fills = [...svg.querySelectorAll('[fill]')];
+        const usesFill = fills.some((f) => f.getAttribute('fill').toLowerCase().includes('currentcolor'));
+        // replace image with SVG, ensuring color inheritance
+        if (usesStyle || usesFill) icon.replaceWith(svg);
         observer.disconnect();
       }
     });
@@ -60,6 +65,12 @@ export function swapIcons() {
   });
 }
 
+/**
+ * Builds an icon element with the specified name and optional modifier class.
+ * @param {string} name Name of the icon
+ * @param {string} [modifier] Optional CSS class modifier
+ * @returns {HTMLSpanElement} Icon element
+ */
 export function buildIcon(name, modifier) {
   const icon = document.createElement('span');
   icon.className = `icon icon-${name}`;
@@ -70,20 +81,36 @@ export function buildIcon(name, modifier) {
 
 /**
  * Builds all synthetic blocks in a container element.
- * @param {Element} main The container element
+ * @param {HTMLElement} main Container element
  */
-// function buildAutoBlocks(main) {
-//   try {
-//     // build auto blocks
-//   } catch (error) {
-//     // eslint-disable-next-line no-console
-//     console.error('Auto Blocking failed', error);
-//   }
-// }
+function buildAutoBlocks(main) {
+  try {
+    // auto block `*/fragments/*` references
+    const fragments = main.querySelectorAll('a[href*="/fragments/"]');
+    if (fragments.length > 0) {
+      // eslint-disable-next-line import/no-cycle
+      import('../blocks/fragment/fragment.js').then(({ loadFragment }) => {
+        fragments.forEach(async (fragment) => {
+          try {
+            const { pathname } = new URL(fragment.href);
+            const frag = await loadFragment(pathname);
+            fragment.parentElement.replaceWith(frag.firstElementChild);
+          } catch (error) {
+            // eslint-disable-next-line no-console
+            console.error('Fragment loading failed', error);
+          }
+        });
+      });
+    }
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error('Auto Blocking failed', error);
+  }
+}
 
 /**
  * Decorates links with appropriate classes to style them as buttons
- * @param {HTMLElement} main The main container element
+ * @param {HTMLElement} main Container element
  */
 function decorateButtons(main) {
   main.querySelectorAll('p a[href]').forEach((a) => {
@@ -115,6 +142,10 @@ function decorateButtons(main) {
   });
 }
 
+/**
+ * Decorates images by adding wrapper classes to their parent paragraphs.
+ * @param {HTMLElement} main Container element
+ */
 function decorateImages(main) {
   main.querySelectorAll('p img').forEach((img) => {
     const p = img.closest('p');
@@ -124,13 +155,13 @@ function decorateImages(main) {
 
 /**
  * Decorates the main element.
- * @param {Element} main The main element
+ * @param {Element} `main` element
  */
 // eslint-disable-next-line import/prefer-default-export
 export function decorateMain(main) {
   decorateIcons(main);
   decorateImages(main);
-  // buildAutoBlocks(main);
+  buildAutoBlocks(main);
   decorateSections(main);
   decorateBlocks(main);
   decorateButtons(main);
@@ -149,8 +180,6 @@ async function loadEager(doc) {
     document.body.classList.add('appear');
     await loadSection(main.querySelector('.section'), waitForFirstImage);
   }
-
-  sampleRUM.enhance();
 
   try {
     /* if desktop (proxy for fast connection) or fonts already loaded, load fonts.css */
@@ -192,6 +221,9 @@ function loadDelayed() {
   // load anything that can be postponed to the latest here
 }
 
+/**
+ * Loads the page by executing eager, lazy, and delayed loading phases.
+ */
 async function loadPage() {
   await loadEager(document);
   await loadLazy(document);
